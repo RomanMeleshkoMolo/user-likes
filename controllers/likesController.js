@@ -1,6 +1,31 @@
 const mongoose = require('mongoose');
 const Like = require('../models/likeModel');
 const User = require('../models/userModel');
+const { sendNewLikeNotification } = require('../services/pushNotificationService');
+const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+const { emitToUser } = require('../src/socketManager');
+
+const s3 = new S3Client({
+  region: process.env.AWS_REGION || 'eu-central-1',
+  credentials: process.env.AWS_ACCESS_KEY_ID ? {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  } : undefined,
+});
+
+async function getPhotoUrl(key) {
+  if (!key) return null;
+  try {
+    const cmd = new GetObjectCommand({
+      Bucket: process.env.S3_BUCKET || 'molo-user-photos',
+      Key: key,
+    });
+    return await getSignedUrl(s3, cmd, { expiresIn: 3600 });
+  } catch {
+    return null;
+  }
+}
 
 // Получить userId из запроса
 function getReqUserId(req) {
@@ -41,13 +66,16 @@ async function getIncomingLikes(req, res) {
           .select('name age userPhoto userLocation isOnline lastSeen')
           .lean();
 
+        const photoKey = fromUser?.userPhoto?.[0]?.key || null;
+        const photoUrl = await getPhotoUrl(photoKey);
+
         return {
           _id: like._id,
           fromUser: fromUser ? {
             _id: fromUser._id,
             name: fromUser.name,
             age: fromUser.age,
-            photo: fromUser.userPhoto?.[0]?.key || null,
+            photo: photoUrl,
             userLocation: fromUser.userLocation,
             isOnline: fromUser.isOnline || false,
           } : null,
@@ -209,6 +237,9 @@ async function likeUser(req, res) {
       return res.status(404).json({ message: 'User not found' });
     }
 
+    // Загружаем данные текущего пользователя (лайкера) для уведомления
+    const currentUser = await User.findById(currentUserObjectId).lean();
+
     // Проверяем, есть ли уже лайк
     const existingLike = await Like.findOne({
       fromUser: currentUserObjectId,
@@ -258,6 +289,22 @@ async function likeUser(req, res) {
     }
 
     console.log(`[likes] User ${currentUserId} liked user ${targetUserId}, isMatch: ${isMatch}`);
+
+    // Отправляем push-уведомление тому, кому поставили лайк (non-blocking)
+    sendNewLikeNotification(targetUserObjectId, {
+      _id: currentUserObjectId,
+      name: currentUser?.name || '',
+      userPhoto: currentUser?.userPhoto || [],
+    }).catch((err) => console.error('[likes] Push notification error:', err));
+
+    // Отправляем real-time уведомление через Socket.IO
+    emitToUser(targetUserId, 'new_like', {
+      fromUser: {
+        _id: String(currentUserId),
+        name: currentUser?.name || '',
+      },
+      isMatch,
+    });
 
     return res.status(201).json({
       success: true,
