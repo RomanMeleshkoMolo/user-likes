@@ -381,6 +381,8 @@ async function acceptLike(req, res) {
       .select('name age userPhoto')
       .lean();
 
+    const matchedPhotoUrl = await getPhotoUrl(matchedUser?.userPhoto?.[0]?.key || null);
+
     console.log(`[likes] User ${userId} accepted like from ${like.fromUser}`);
 
     return res.json({
@@ -389,7 +391,7 @@ async function acceptLike(req, res) {
       matchedUser: matchedUser ? {
         _id: matchedUser._id,
         name: matchedUser.name,
-        photo: matchedUser.userPhoto?.[0]?.key || null,
+        photo: matchedPhotoUrl,
       } : null,
     });
   } catch (e) {
